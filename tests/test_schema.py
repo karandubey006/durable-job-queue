@@ -7,7 +7,7 @@ from jobq.migrate import migrate
 def test_migrate_is_idempotent(db_url, conn):
     assert migrate(db_url) == []  # everything already applied by the fixture
     versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-    assert versions == ["001_jobs.sql", "002_claim_index.sql"]
+    assert versions == ["001_jobs.sql", "002_claim_index.sql", "003_leases.sql"]
 
 
 def test_insert_defaults(conn):
@@ -35,3 +35,8 @@ def test_required_columns(conn, column):
     other = "type" if column == "tenant_id" else "tenant_id"
     with pytest.raises(psycopg.errors.NotNullViolation):
         conn.execute(f"INSERT INTO jobs ({other}) VALUES ('x')")
+
+
+def test_running_job_must_hold_a_lease(conn):
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO jobs (tenant_id, type, state) VALUES ('t1', 'noop', 'running')")

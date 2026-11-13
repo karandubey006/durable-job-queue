@@ -35,5 +35,17 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Requeues jobs whose lease expired (a worker died). Restarted if it crashes:
+  # while it's down, nothing is lost, but nothing is recovered either.
+  reaper:
+    build: .
+    command: ["python", "-m", "jobq.reaper"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://jobq:jobq@db:5432/jobq
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:

@@ -1,7 +1,8 @@
-"""A worker process: claim a job, run its handler, complete or fail it, repeat.
+"""A worker process: claim a job, run its handler while heartbeating, ack, repeat.
 
 Run with: python -m jobq.worker [--handlers some.module]
-The handlers module must define HANDLERS: dict[str, callable].
+The handlers module must define HANDLERS: dict[str, callable]. A handler is
+called as handler(job, conn, lease); see jobq/handlers.py.
 """
 
 import argparse
@@ -16,6 +17,7 @@ from psycopg.rows import dict_row
 
 from jobq import queue
 from jobq.db import database_url
+from jobq.settings import Settings
 
 log = logging.getLogger("jobq.worker")
 
@@ -25,10 +27,78 @@ IDLE_MIN = 0.05
 IDLE_MAX = 1.0
 
 
+class LeaseLost(Exception):
+    """Raised by Lease.check() once this worker no longer owns the job."""
+
+
+class Lease:
+    """A handler's view of its claim on a job (D16: cooperative cancellation).
+
+    Long handlers should call lease.check() at safe points. It raises
+    LeaseLost once a heartbeat has been rejected, meaning another worker may
+    already own the job.
+    """
+
+    def __init__(self, job_id: int, token: int):
+        self.job_id = job_id
+        self.token = token
+        self._lost = threading.Event()
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    def check(self) -> None:
+        if self.lost:
+            raise LeaseLost(f"job {self.job_id}: lease {self.token} lost")
+
+
+class Heartbeat:
+    """While active, extends a lease every `interval` seconds on its own thread.
+
+    Uses its own connection: the handler is using the main one, and a slow
+    query there must not delay heartbeats. Stops at the first rejected
+    heartbeat, marking the lease lost.
+    """
+
+    def __init__(self, conn, lease: Lease, settings: Settings):
+        self.conn = conn
+        self.lease = lease
+        self.settings = settings
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._done.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        # wait() returns True when __exit__ sets _done, ending the loop.
+        while not self._done.wait(self.settings.heartbeat_seconds):
+            try:
+                ok = queue.heartbeat(
+                    self.conn, self.lease.job_id, self.lease.token, self.settings.lease_seconds
+                )
+            except psycopg.Error:
+                # Can't tell whether we still own the job. Keep trying: if the
+                # lease is gone by the time the DB answers, we'll find out then.
+                log.exception("job %s: heartbeat errored, retrying", self.lease.job_id)
+                continue
+            if not ok:
+                log.warning("job %s: heartbeat rejected, lease lost", self.lease.job_id)
+                self.lease._lost.set()
+                return
+
+
 class Worker:
-    def __init__(self, url: str, handlers: dict):
+    def __init__(self, url: str, handlers: dict, settings: Settings | None = None):
         self.url = url
         self.handlers = handlers
+        self.settings = settings or Settings.from_env()
         self._stop = threading.Event()
 
     def stop(self, *_args) -> None:
@@ -36,32 +106,52 @@ class Worker:
         self._stop.set()
 
     def run(self) -> None:
-        with psycopg.connect(self.url, autocommit=True, row_factory=dict_row) as conn:
+        connect = lambda: psycopg.connect(self.url, autocommit=True, row_factory=dict_row)  # noqa: E731
+        with connect() as conn, connect() as heartbeat_conn:
             idle = IDLE_MIN
             while not self._stop.is_set():
-                job = queue.claim(conn)
+                job = queue.claim(conn, self.settings.lease_seconds)
                 if job is None:
                     self._stop.wait(idle)  # returns early if stop() is called
                     idle = min(idle * 2, IDLE_MAX)
                     continue
                 idle = IDLE_MIN
-                self._execute(conn, job)
+                self._execute(conn, heartbeat_conn, job)
 
-    def _execute(self, conn, job: dict) -> None:
+    def _execute(self, conn, heartbeat_conn, job: dict) -> None:
+        job_id, token = job["id"], job["lease_token"]
         handler = self.handlers.get(job["type"])
         if handler is None:
-            log.error("job %s: no handler for type %r", job["id"], job["type"])
-            queue.fail(conn, job["id"])
+            log.error("job %s: no handler for type %r", job_id, job["type"])
+            error = f"no handler for type {job['type']!r}"
+            self._ack(job, queue.fail(conn, job_id, token, error), "failed")
             return
+
+        lease = Lease(job_id, token)
         try:
-            handler(job, conn)
-        except Exception:
-            log.exception("job %s failed", job["id"])
-            if not queue.fail(conn, job["id"]):
-                log.warning("job %s: fail ignored, job is no longer running", job["id"])
+            with Heartbeat(heartbeat_conn, lease, self.settings):
+                handler(job, conn, lease)
+        except LeaseLost:
+            # Another worker may own the job now. Don't ack: the fence would
+            # reject it anyway.
+            log.warning("job %s attempt %s: lease lost, abandoned", job_id, job["attempts"])
+        except Exception as exc:
+            log.exception("job %s attempt %s failed", job_id, job["attempts"])
+            self._ack(job, queue.fail(conn, job_id, token, repr(exc)), "failed")
         else:
-            if not queue.complete(conn, job["id"]):
-                log.warning("job %s: complete ignored, job is no longer running", job["id"])
+            self._ack(job, queue.complete(conn, job_id, token), "succeeded")
+
+    @staticmethod
+    def _ack(job: dict, accepted: bool, outcome: str) -> None:
+        # Always try the ack, even if a heartbeat was rejected: the fence in
+        # the database decides, not the worker's view of its lease.
+        if accepted:
+            log.info("job %s attempt %s: %s", job["id"], job["attempts"], outcome)
+        else:
+            log.warning(
+                "job %s attempt %s: %s ack rejected, lease %s is no longer current",
+                job["id"], job["attempts"], outcome, job["lease_token"],
+            )
 
 
 def main() -> None:
@@ -74,11 +164,11 @@ def main() -> None:
     )
     handlers = importlib.import_module(args.handlers).HANDLERS
     worker = Worker(database_url(), handlers)
-    # SIGTERM / Ctrl-C: stop after the current job. (SIGKILL can't be caught;
-    # that's the crash case Phase 2 handles.)
+    # SIGTERM / Ctrl-C: stop after the current job. SIGKILL can't be caught:
+    # the job's lease expires and the reaper requeues it.
     signal.signal(signal.SIGTERM, worker.stop)
     signal.signal(signal.SIGINT, worker.stop)
-    log.info("started with handlers: %s", ", ".join(sorted(handlers)))
+    log.info("started with handlers: %s; %s", ", ".join(sorted(handlers)), worker.settings)
     worker.run()
     log.info("stopped")
 

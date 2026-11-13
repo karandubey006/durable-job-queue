@@ -28,6 +28,7 @@ def db_url():
             """
             CREATE TABLE test_executions (
                 job_id      bigint      NOT NULL,
+                attempt     integer     NOT NULL,
                 pid         integer     NOT NULL,
                 executed_at timestamptz NOT NULL DEFAULT clock_timestamp()
             )

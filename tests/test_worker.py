@@ -1,30 +1,22 @@
+import logging
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+from psycopg.types.json import Jsonb
+
+from jobq.reaper import Reaper
+from jobq.settings import Settings
 from jobq.worker import Worker
 from tests.handlers import HANDLERS
+from tests.helpers import unfinished, wait_until
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def wait_until(predicate, timeout, interval=0.1):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
-
-
-def unfinished(conn):
-    return conn.execute(
-        "SELECT count(*) FROM jobs WHERE state IN ('queued', 'running')"
-    ).fetchone()[0]
 
 
 def test_worker_completes_fails_and_rejects_unknown_types(conn, db_url):
@@ -99,3 +91,61 @@ def test_eight_workers_drain_10000_jobs_exactly_once(conn, db_url, tmp_path):
     assert conn.execute(
         "SELECT count(*) FILTER (WHERE state = 'succeeded'), max(attempts) FROM jobs"
     ).fetchone() == (n_jobs, 1)
+
+
+# Short timings so lease expiry happens within a test.
+FAST = Settings(lease_seconds=1.0, heartbeat_seconds=0.3, reaper_interval=0.1)
+
+
+@contextmanager
+def running(*runners):
+    """Run Worker/Reaper objects on threads for the duration of the block."""
+    threads = [threading.Thread(target=r.run) for r in runners]
+    for t in threads:
+        t.start()
+    try:
+        yield
+    finally:
+        for r in runners:
+            r.stop()
+        for t in threads:
+            t.join(timeout=10)
+
+
+def add_job(conn, type_, payload):
+    return conn.execute(
+        "INSERT INTO jobs (tenant_id, type, payload) VALUES ('t1', %s, %s) RETURNING id",
+        (type_, Jsonb(payload)),
+    ).fetchone()[0]
+
+
+def test_heartbeats_keep_a_job_longer_than_its_lease_alive(conn, db_url):
+    # 3 s of work on a 1 s lease, with the reaper sweeping every 0.1 s.
+    job_id = add_job(conn, "sleep", {"seconds": 3})
+
+    with running(Worker(db_url, HANDLERS, FAST), Reaper(db_url, FAST)):
+        assert wait_until(lambda: unfinished(conn) == 0, timeout=10)
+
+    assert conn.execute("SELECT state, attempts FROM jobs WHERE id = %s", (job_id,)).fetchone() == (
+        "succeeded", 1
+    )
+    assert conn.execute("SELECT count(*) FROM test_executions").fetchone()[0] == 1
+
+
+def test_handler_stops_when_its_lease_is_taken(conn, db_url, caplog):
+    caplog.set_level(logging.INFO)
+    job_id = add_job(conn, "sleep_cooperative", {"seconds": 30})
+    worker = Worker(db_url, HANDLERS, FAST)
+
+    with running(worker):
+        assert wait_until(lambda: conn.execute("SELECT count(*) FROM test_executions").fetchone()[0], 5)
+        # Someone else takes the job: as if the lease expired and it was re-claimed.
+        conn.execute(
+            "UPDATE jobs SET lease_token = nextval('lease_token_seq') WHERE id = %s", (job_id,)
+        )
+        # The next heartbeat is rejected, the handler's lease.check() raises,
+        # and the worker abandons the job well before the 30 s of work.
+        assert wait_until(lambda: "lease lost, abandoned" in caplog.text, timeout=3)
+
+    assert conn.execute("SELECT state FROM jobs WHERE id = %s", (job_id,)).fetchone()[0] == "running"
+    assert "ack rejected" not in caplog.text  # it didn't even try to ack
