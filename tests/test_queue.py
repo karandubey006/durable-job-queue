@@ -194,7 +194,7 @@ def test_late_ack_on_a_reaped_but_unclaimed_job_is_rejected(conn, qconn):
     assert row(conn, job_id)["lease_token"] == a["lease_token"]  # token left in place
 
     assert queue.complete(qconn, job_id, a["lease_token"]) is False
-    assert state_of(conn, job_id) == "queued"  # not 'succeeded' without having run
+    assert state_of(conn, job_id) == "queued"  # the reaper's decision stands
 
 
 def test_ack_after_expiry_is_accepted_if_nobody_reaped_it(conn, qconn):

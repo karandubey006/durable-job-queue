@@ -48,7 +48,8 @@ RETURNING id, tenant_id, type, payload, attempts, max_attempts, lease_token
 #     claim would have replaced the token.
 #   - state = 'running': the job hasn't been reaped back to 'queued'. A reaped
 #     job keeps its old token until it's claimed again, so the token check
-#     alone would let a zombie mark a queued job succeeded without running it.
+#     alone would let a holder whose lease was already revoked still ack,
+#     overriding the reaper's decision (or, from Phase 3, a DLQ replay).
 # The lease's expiry time is deliberately *not* checked. If the lease has
 # expired but nobody has reaped or re-claimed the job, no one else holds it,
 # so the holder's write is still safe.
