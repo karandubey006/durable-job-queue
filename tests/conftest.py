@@ -20,14 +20,27 @@ def db_url():
         conn.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)")
         conn.execute(f"CREATE DATABASE {TEST_DB}")
     migrate(TEST_URL)
+    with psycopg.connect(TEST_URL, autocommit=True) as conn:
+        # Test-only: tests/handlers.py records every handler execution here, so
+        # tests can check each job ran exactly once. (Phase 3's job_attempts
+        # table replaces this.)
+        conn.execute(
+            """
+            CREATE TABLE test_executions (
+                job_id      bigint      NOT NULL,
+                pid         integer     NOT NULL,
+                executed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+            """
+        )
     return TEST_URL
 
 
 @pytest.fixture
 def conn(db_url):
-    """A fresh, empty jobs table for every test."""
+    """Fresh, empty tables for every test."""
     with psycopg.connect(db_url, autocommit=True) as conn:
-        conn.execute("TRUNCATE jobs RESTART IDENTITY")
+        conn.execute("TRUNCATE jobs, test_executions RESTART IDENTITY")
         yield conn
 
 

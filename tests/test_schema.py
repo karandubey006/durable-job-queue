@@ -6,8 +6,8 @@ from jobq.migrate import migrate
 
 def test_migrate_is_idempotent(db_url, conn):
     assert migrate(db_url) == []  # everything already applied by the fixture
-    versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations")]
-    assert versions == ["001_jobs.sql"]
+    versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+    assert versions == ["001_jobs.sql", "002_claim_index.sql"]
 
 
 def test_insert_defaults(conn):
