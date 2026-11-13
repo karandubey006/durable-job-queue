@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: jobq
+      POSTGRES_PASSWORD: jobq
+      POSTGRES_DB: jobq
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobq -d jobq"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Runs pending migrations once, then exits. The API waits for it to succeed.
+  migrate:
+    build: .
+    command: ["python", "-m", "jobq.migrate"]
+    environment:
+      DATABASE_URL: postgresql://jobq:jobq@db:5432/jobq
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://jobq:jobq@db:5432/jobq
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

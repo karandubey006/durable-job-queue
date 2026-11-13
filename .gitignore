@@ -1,0 +1,7 @@
+durable-job-queue-build-plan.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
