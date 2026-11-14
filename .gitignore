@@ -5,3 +5,6 @@ durable-job-queue-build-plan.md
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Design notes and learnings are private; README.md is the only public doc.
+docs/

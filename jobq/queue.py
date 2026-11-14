@@ -16,6 +16,40 @@ write.
 """
 
 from psycopg import Connection
+from psycopg.types.json import Jsonb
+
+# The columns a job is returned with, by submit and by the API.
+JOB_COLUMNS = (
+    "id, tenant_id, type, payload, state, attempts, max_attempts, run_at, created_at,"
+    " last_error, idempotency_key"
+)
+
+# Submission (D24). With an idempotency key, the UNIQUE (tenant_id,
+# idempotency_key) constraint decides who's first, atomically:
+#   - No conflict: the job is inserted and returned. A new job.
+#   - Conflict: nothing is written and nothing is returned. If another
+#     transaction is inserting the same key right now, this statement *waits*
+#     for it to commit or roll back first, so a reported conflict always means
+#     a committed job holds the key.
+# DO NOTHING instead of a no-op DO UPDATE: a duplicate writes no new row
+# version, so it leaves no dead tuples behind in the hottest table.
+# Without a key (NULL), nothing ever conflicts: every submit is a new job.
+SUBMIT_SQL = f"""
+INSERT INTO jobs (tenant_id, type, payload, max_attempts, run_at, idempotency_key)
+VALUES (%(tenant_id)s, %(type)s, %(payload)s, %(max_attempts)s,
+        COALESCE(%(run_at)s, now()), %(idempotency_key)s)
+ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+RETURNING {JOB_COLUMNS}
+"""
+
+# The job that won the key. In Read Committed every statement takes a fresh
+# snapshot, so this sees the winner that SUBMIT_SQL just conflicted with.
+# (Under Repeatable Read it wouldn't: the snapshot would predate the commit.)
+SUBMITTED_SQL = f"""
+SELECT {JOB_COLUMNS} FROM jobs
+WHERE  tenant_id = %(tenant_id)s AND idempotency_key = %(idempotency_key)s
+"""
+
 
 # Picks the next runnable job, locks it, marks it running, gives it a fresh
 # lease, records the attempt and returns the job, all in one statement.
@@ -170,6 +204,45 @@ SET    state        = 'queued',
 WHERE  id = %(id)s AND tenant_id = %(tenant_id)s AND state = 'dead'
 RETURNING id
 """
+
+
+class KeyReused(Exception):
+    """The idempotency key already belongs to a job with a different request (D23)."""
+
+
+def submit(
+    conn: Connection,
+    tenant_id: str,
+    type_: str,
+    payload: dict,
+    max_attempts: int,
+    run_at=None,
+    idempotency_key: str | None = None,
+) -> tuple[dict, bool]:
+    """Enqueue a job. Returns (job, created): created is False when the key
+    already had a job and that existing job is returned instead.
+
+    Raises KeyReused if the existing job was submitted with a different type,
+    payload or max_attempts (D23). run_at isn't compared: an omitted run_at
+    means "now", which differs on every retry.
+    """
+    params = {
+        "tenant_id": tenant_id,
+        "type": type_,
+        "payload": Jsonb(payload),
+        "max_attempts": max_attempts,
+        "run_at": run_at,
+        "idempotency_key": idempotency_key,
+    }
+    job = conn.execute(SUBMIT_SQL, params).fetchone()
+    if job is not None:
+        return job, True
+    existing = conn.execute(SUBMITTED_SQL, params).fetchone()
+    if (existing["type"], existing["payload"], existing["max_attempts"]) != (
+        type_, payload, max_attempts
+    ):
+        raise KeyReused(f"idempotency key {idempotency_key!r} was used for a different request")
+    return existing, False
 
 
 def claim(conn: Connection, lease_seconds: float, worker: str) -> dict | None:

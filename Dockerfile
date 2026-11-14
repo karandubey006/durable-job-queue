@@ -8,6 +8,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY jobq ./jobq
+COPY fake_payments ./fake_payments
 COPY migrations ./migrations
 RUN uv sync --frozen --no-dev
 

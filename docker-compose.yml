@@ -47,5 +47,18 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # The external payments API the `charge` handler calls. Its own database:
+  # nothing it does can share a transaction with jobq.
+  payments:
+    build: .
+    command: ["python", "-m", "fake_payments"]
+    environment:
+      PAYMENTS_DATABASE_URL: postgresql://jobq:jobq@db:5432/payments
+    ports:
+      - "8001:8001"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

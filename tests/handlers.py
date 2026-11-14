@@ -3,6 +3,8 @@
 import os
 import time
 
+from jobq.handlers import charge
+
 
 def record(job, conn, lease):
     """Record that this attempt of the job ran, and in which process."""
@@ -53,7 +55,17 @@ def sleep_cooperative(job, conn, lease):
         time.sleep(0.05)
 
 
+def charge_then_crash(job, conn, lease):
+    """The real charge handler, then die on attempt 1: after the side effect,
+    before the worker can ack. The duplicate window, on demand (D25)."""
+    charge(job, conn, lease)
+    if job["attempts"] == 1:
+        os._exit(1)
+
+
 HANDLERS = {
+    "charge": charge,
+    "charge_then_crash": charge_then_crash,
     "record": record,
     "boom": boom,
     "flaky": flaky,

@@ -4,18 +4,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from pydantic import AwareDatetime, BaseModel, Field
 
 from jobq import queue
 from jobq.db import database_url
 
-JOB_COLUMNS = (
-    "id, tenant_id, type, payload, state, attempts, max_attempts, run_at, created_at, last_error"
-)
+JOB_COLUMNS = queue.JOB_COLUMNS
 
 
 class JobIn(BaseModel):
@@ -37,6 +34,7 @@ class Job(BaseModel):
     run_at: datetime
     created_at: datetime
     last_error: str | None
+    idempotency_key: str | None
 
 
 class ReplayIn(BaseModel):
@@ -45,6 +43,9 @@ class ReplayIn(BaseModel):
 
 
 TenantId = Annotated[str, Header(alias="X-Tenant-Id", min_length=1, max_length=200)]
+IdempotencyKey = Annotated[
+    str | None, Header(alias="Idempotency-Key", min_length=1, max_length=255)
+]
 
 
 @asynccontextmanager
@@ -60,25 +61,29 @@ app = FastAPI(title="jobq", lifespan=lifespan)
 
 
 @app.post("/jobs", status_code=201, response_model=Job)
-def submit_job(job: JobIn, tenant_id: TenantId, request: Request):
-    with request.app.state.pool.connection() as conn:
-        row = conn.execute(
-            f"""
-            INSERT INTO jobs (tenant_id, type, payload, max_attempts, run_at)
-            VALUES (%(tenant_id)s, %(type)s, %(payload)s, %(max_attempts)s,
-                    COALESCE(%(run_at)s, now()))
-            RETURNING {JOB_COLUMNS}
-            """,
-            {
-                "tenant_id": tenant_id,
-                "type": job.type,
-                "payload": Jsonb(job.payload),
-                "max_attempts": job.max_attempts,
-                "run_at": job.run_at,
-            },
-        ).fetchone()
+def submit_job(
+    job: JobIn,
+    tenant_id: TenantId,
+    request: Request,
+    response: Response,
+    idempotency_key: IdempotencyKey = None,
+):
+    """Enqueue a job. With an Idempotency-Key, a retry of the same request
+    returns the original job (200, Idempotent-Replayed: true) instead of
+    creating a second one; reusing the key for a different request is a 422."""
+    try:
+        with request.app.state.pool.connection() as conn:
+            row, created = queue.submit(
+                conn, tenant_id, job.type, job.payload, job.max_attempts, job.run_at,
+                idempotency_key,
+            )
+    except queue.KeyReused as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     # The pool commits when the `with` block exits cleanly, so by the time we
-    # return 201 the job is durable. An exception above rolls it back instead.
+    # return, the job is durable. An exception above rolls it back instead.
+    if not created:
+        response.status_code = 200
+        response.headers["Idempotent-Replayed"] = "true"
     return row
 
 

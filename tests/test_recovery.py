@@ -1,62 +1,10 @@
 """Crash recovery with real worker processes: SIGKILL (dead) and SIGSTOP (zombie)."""
 
-import os
 import signal
-import subprocess
-import sys
-import threading
-from pathlib import Path
 
-import pytest
 from psycopg.types.json import Jsonb
 
-from jobq.reaper import Reaper
-from jobq.settings import Settings
-from tests.helpers import wait_until
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TIMING = Settings(lease_seconds=2.0, heartbeat_seconds=0.5, reaper_interval=0.5)
-
-
-@pytest.fixture
-def spawn_worker(db_url, tmp_path):
-    """Start worker processes with TIMING; kill any still running at the end."""
-    procs = []
-
-    def spawn(name):
-        log_path = tmp_path / f"{name}.log"
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "jobq.worker", "--handlers", "tests.handlers"],
-            cwd=REPO_ROOT,
-            env={
-                **os.environ,
-                "DATABASE_URL": db_url,
-                "JOBQ_LEASE_SECONDS": str(TIMING.lease_seconds),
-                "JOBQ_HEARTBEAT_SECONDS": str(TIMING.heartbeat_seconds),
-            },
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-        )
-        proc.log_path = log_path
-        procs.append(proc)
-        assert wait_until(lambda: "started" in log_path.read_text(), timeout=10)
-        return proc
-
-    yield spawn
-    for proc in procs:
-        proc.kill()
-        proc.wait()
-
-
-@pytest.fixture
-def reaper(db_url):
-    r = Reaper(db_url, TIMING)
-    thread = threading.Thread(target=r.run)
-    thread.start()
-    yield r
-    r.stop()
-    thread.join(timeout=5)
-
+from tests.helpers import TIMING, wait_until
 
 def add_job(conn, type_, payload):
     return conn.execute(
