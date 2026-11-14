@@ -10,13 +10,16 @@ import importlib
 import logging
 import os
 import signal
+import socket
 import threading
 
 import psycopg
 from psycopg.rows import dict_row
 
 from jobq import queue
+from jobq.backoff import full_jitter
 from jobq.db import database_url
+from jobq.errors import PermanentError, is_retryable
 from jobq.settings import Settings
 
 log = logging.getLogger("jobq.worker")
@@ -95,10 +98,14 @@ class Heartbeat:
 
 
 class Worker:
-    def __init__(self, url: str, handlers: dict, settings: Settings | None = None):
+    def __init__(
+        self, url: str, handlers: dict, settings: Settings | None = None, name: str | None = None
+    ):
         self.url = url
         self.handlers = handlers
         self.settings = settings or Settings.from_env()
+        # Recorded on every attempt in job_attempts.worker.
+        self.name = name or f"{socket.gethostname()}:{os.getpid()}"
         self._stop = threading.Event()
 
     def stop(self, *_args) -> None:
@@ -110,7 +117,7 @@ class Worker:
         with connect() as conn, connect() as heartbeat_conn:
             idle = IDLE_MIN
             while not self._stop.is_set():
-                job = queue.claim(conn, self.settings.lease_seconds)
+                job = queue.claim(conn, self.settings.lease_seconds, self.name)
                 if job is None:
                     self._stop.wait(idle)  # returns early if stop() is called
                     idle = min(idle * 2, IDLE_MAX)
@@ -119,27 +126,42 @@ class Worker:
                 self._execute(conn, heartbeat_conn, job)
 
     def _execute(self, conn, heartbeat_conn, job: dict) -> None:
-        job_id, token = job["id"], job["lease_token"]
         handler = self.handlers.get(job["type"])
         if handler is None:
-            log.error("job %s: no handler for type %r", job_id, job["type"])
-            error = f"no handler for type {job['type']!r}"
-            self._ack(job, queue.fail(conn, job_id, token, error), "failed")
+            log.error("job %s: no handler for type %r", job["id"], job["type"])
+            self._fail(conn, job, PermanentError(f"no handler for type {job['type']!r}"))
             return
 
-        lease = Lease(job_id, token)
+        lease = Lease(job["id"], job["lease_token"])
         try:
             with Heartbeat(heartbeat_conn, lease, self.settings):
                 handler(job, conn, lease)
         except LeaseLost:
             # Another worker may own the job now. Don't ack: the fence would
             # reject it anyway.
-            log.warning("job %s attempt %s: lease lost, abandoned", job_id, job["attempts"])
+            log.warning("job %s attempt %s: lease lost, abandoned", job["id"], job["attempts"])
         except Exception as exc:
-            log.exception("job %s attempt %s failed", job_id, job["attempts"])
-            self._ack(job, queue.fail(conn, job_id, token, repr(exc)), "failed")
+            log.exception("job %s attempt %s raised", job["id"], job["attempts"])
+            self._fail(conn, job, exc)
         else:
-            self._ack(job, queue.complete(conn, job_id, token), "succeeded")
+            accepted = queue.complete(conn, job["id"], job["lease_token"])
+            self._ack(job, accepted, "succeeded")
+
+    def _fail(self, conn, job: dict, exc: Exception) -> None:
+        """Classify the error (D17), pick a backoff delay (D18) and record the
+        failure. The SQL decides between retry and DLQ, since only it knows
+        the attempt count at the moment of the write."""
+        retryable = is_retryable(exc)
+        delay = full_jitter(job["attempts"], self.settings.backoff_base, self.settings.backoff_cap)
+        state = queue.fail(conn, job["id"], job["lease_token"], repr(exc), retryable, delay)
+        kind = "retryable" if retryable else "permanent"
+        if state == "queued":
+            outcome = f"failed ({kind}) -> queued, retry in {delay:.2f}s"
+        elif state == "dead":
+            outcome = f"failed ({kind}) -> dead"
+        else:
+            outcome = "failed"
+        self._ack(job, state is not None, outcome)
 
     @staticmethod
     def _ack(job: dict, accepted: bool, outcome: str) -> None:

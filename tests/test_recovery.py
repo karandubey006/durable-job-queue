@@ -101,6 +101,11 @@ def test_kill_9_mid_job_is_recovered_within_lease_plus_reaper_interval(
     recovery = (restarted_at - killed_at).total_seconds()
     print(f"recovered in {recovery:.2f}s (bound {bound}s)")
     assert recovery <= bound
+    # The history tells the story: the killed attempt was closed by the reaper.
+    assert conn.execute(
+        "SELECT attempt, outcome FROM job_attempts WHERE job_id = %s ORDER BY lease_token",
+        (job_id,),
+    ).fetchall() == [(1, "lease_expired"), (2, "succeeded")]
 
 
 def test_zombie_workers_late_ack_is_rejected_while_new_owner_runs(

@@ -1,18 +1,21 @@
-"""HTTP API: submit a job and fetch it."""
+"""HTTP API: submit and fetch jobs, list the DLQ, replay dead jobs."""
 
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from pydantic import AwareDatetime, BaseModel, Field
 
+from jobq import queue
 from jobq.db import database_url
 
-JOB_COLUMNS = "id, tenant_id, type, payload, state, attempts, max_attempts, run_at, created_at"
+JOB_COLUMNS = (
+    "id, tenant_id, type, payload, state, attempts, max_attempts, run_at, created_at, last_error"
+)
 
 
 class JobIn(BaseModel):
@@ -33,6 +36,12 @@ class Job(BaseModel):
     max_attempts: int
     run_at: datetime
     created_at: datetime
+    last_error: str | None
+
+
+class ReplayIn(BaseModel):
+    # Attempts to add on top of those already used. None: the job's current max_attempts.
+    extra_attempts: int | None = Field(default=None, ge=1, le=100)
 
 
 TenantId = Annotated[str, Header(alias="X-Tenant-Id", min_length=1, max_length=200)]
@@ -83,4 +92,45 @@ def get_job(job_id: int, tenant_id: TenantId, request: Request):
     if row is None:
         # Another tenant's job is indistinguishable from a missing one.
         raise HTTPException(status_code=404, detail="job not found")
+    return row
+
+
+@app.get("/dlq", response_model=list[Job])
+def list_dead_jobs(
+    tenant_id: TenantId,
+    request: Request,
+    after_id: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+):
+    """The tenant's dead jobs, oldest first. Page with after_id = last id seen."""
+    with request.app.state.pool.connection() as conn:
+        return conn.execute(
+            f"""
+            SELECT {JOB_COLUMNS} FROM jobs
+            WHERE  tenant_id = %s AND state = 'dead' AND id > %s
+            ORDER  BY id
+            LIMIT  %s
+            """,
+            (tenant_id, after_id, limit),
+        ).fetchall()
+
+
+@app.post("/jobs/{job_id}/replay", response_model=Job)
+def replay_job(
+    job_id: int, tenant_id: TenantId, request: Request, body: ReplayIn | None = None
+):
+    """Send a dead job back to the queue with more attempts (D22)."""
+    extra = body.extra_attempts if body else None
+    with request.app.state.pool.connection() as conn:
+        replayed = queue.replay(conn, job_id, tenant_id, extra)
+        row = conn.execute(
+            f"SELECT {JOB_COLUMNS} FROM jobs WHERE id = %s AND tenant_id = %s",
+            (job_id, tenant_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if not replayed:
+        raise HTTPException(
+            status_code=409, detail=f"job is {row['state']}, only dead jobs can be replayed"
+        )
     return row

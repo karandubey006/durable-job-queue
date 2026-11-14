@@ -41,7 +41,7 @@ def db_url():
 def conn(db_url):
     """Fresh, empty tables for every test."""
     with psycopg.connect(db_url, autocommit=True) as conn:
-        conn.execute("TRUNCATE jobs, test_executions RESTART IDENTITY")
+        conn.execute("TRUNCATE jobs, job_attempts, test_executions RESTART IDENTITY")
         yield conn
 
 

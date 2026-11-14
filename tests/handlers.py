@@ -16,6 +16,19 @@ def boom(job, conn, lease):
     raise RuntimeError("boom")
 
 
+def flaky(job, conn, lease):
+    """Fail with a transient error until attempt payload["succeed_on"]."""
+    record(job, conn, lease)
+    if job["attempts"] < job["payload"]["succeed_on"]:
+        raise ConnectionResetError("payments API reset the connection")
+
+
+def poison(job, conn, lease):
+    """Fail with a transient-looking error on every attempt."""
+    record(job, conn, lease)
+    raise TimeoutError("payments API timed out")
+
+
 def _seconds(job) -> float:
     """payload["seconds"]: a number, or a list giving the duration per attempt."""
     seconds = job["payload"]["seconds"]
@@ -43,6 +56,8 @@ def sleep_cooperative(job, conn, lease):
 HANDLERS = {
     "record": record,
     "boom": boom,
+    "flaky": flaky,
+    "poison": poison,
     "sleep": sleep,
     "sleep_cooperative": sleep_cooperative,
 }

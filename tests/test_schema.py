@@ -7,7 +7,7 @@ from jobq.migrate import migrate
 def test_migrate_is_idempotent(db_url, conn):
     assert migrate(db_url) == []  # everything already applied by the fixture
     versions = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-    assert versions == ["001_jobs.sql", "002_claim_index.sql", "003_leases.sql"]
+    assert versions == ["001_jobs.sql", "002_claim_index.sql", "003_leases.sql", "004_attempts.sql"]
 
 
 def test_insert_defaults(conn):
@@ -40,3 +40,11 @@ def test_required_columns(conn, column):
 def test_running_job_must_hold_a_lease(conn):
     with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute("INSERT INTO jobs (tenant_id, type, state) VALUES ('t1', 'noop', 'running')")
+
+
+def test_attempt_numbers_are_unique_per_job(conn):
+    job_id = conn.execute("INSERT INTO jobs (tenant_id, type) VALUES ('t1', 'noop') RETURNING id").fetchone()[0]
+    insert = "INSERT INTO job_attempts (lease_token, job_id, attempt, worker) VALUES (%s, %s, 1, 'w')"
+    conn.execute(insert, (1, job_id))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        conn.execute(insert, (2, job_id))

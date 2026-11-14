@@ -3,7 +3,9 @@
 `job` is the claimed row as a dict. `conn` is the worker's autocommit
 connection. `lease` is a jobq.worker.Lease: long handlers should call
 lease.check() at safe points, which raises once the lease is lost.
-Raising an exception fails the job; returning completes it.
+Returning completes the job. Raising fails the attempt: network and database
+errors (or jobq.errors.RetryableError) are retried with backoff, anything else
+(or jobq.errors.PermanentError) sends the job straight to the DLQ.
 """
 
 import time
